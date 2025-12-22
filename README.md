@@ -1,2 +1,2 @@
-# heterogeneus-parallelization
-Heterogeneus Parallelization
+# Heterogeneus Parallelization
+
