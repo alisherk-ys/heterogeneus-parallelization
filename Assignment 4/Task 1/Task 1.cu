@@ -3,119 +3,123 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include <iomanip>
+#include <cstdint>
 
-// Простая проверка ошибок CUDA, чтобы не ловить "тихие" баги
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        std::cerr << "CUDA error: " << cudaGetErrorString(err) \
-                  << " | file: " << __FILE__ << " line: " << __LINE__ << "\n"; \
-        std::exit(1); \
-    } \
-} while(0)
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t err = (call);                                            \
+        if (err != cudaSuccess) {                                            \
+            std::cerr << "CUDA error: " << cudaGetErrorString(err)           \
+                      << " at " << __FILE__ << ":" << __LINE__ << "\n";      \
+            std::exit(1);                                                    \
+        }                                                                    \
+    } while (0)
 
-// GPU kernel: считаем сумму через глобальную память
-// - каждый поток суммирует свою "полоску" элементов (stride по grid)
-// - потом добавляет частичную сумму в один общий результат через atomicAdd
-__global__ void sumGlobalAtomic(const float* __restrict__ d_arr, int n, float* d_sum)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
+// Kernel: каждый блок считает частичную сумму в shared, затем один поток пишет сумму блока в global.
+// Это соответствует "читаем из глобальной памяти", а сведение делаем внутри блока.
+__global__ void sum_global_kernel(const int* d_in, long long* d_blockSums, int n) {
+    extern __shared__ long long sdata[]; // shared для редукции
 
-    float local = 0.0f;
-    for (int i = tid; i < n; i += stride) {
-        local += d_arr[i]; // читаем из глобальной памяти
+    int tid = threadIdx.x;
+    int global_i = blockIdx.x * blockDim.x + tid;
+
+    // Берём значение из глобальной памяти (или 0, если вышли за границу)
+    long long x = 0;
+    if (global_i < n) x = (long long)d_in[global_i];
+
+    // Кладём в shared и редуцируем внутри блока
+    sdata[tid] = x;
+    __syncthreads();
+
+    // Простая редукция: пополам, пока не останется 1 значение
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
     }
 
-    // общий итог хранится тоже в глобальной памяти
-    atomicAdd(d_sum, local);
+    // Поток 0 пишет сумму блока в глобальную память
+    if (tid == 0) {
+        d_blockSums[blockIdx.x] = sdata[0];
+    }
 }
 
-// CPU версия (последовательно)
-double cpuSum(const std::vector<float>& a)
-{
-    double s = 0.0; // double, чтобы на CPU было аккуратнее по точности
-    for (size_t i = 0; i < a.size(); ++i) {
-        s += a[i];
-    }
+static long long cpu_sum(const std::vector<int>& a) {
+    long long s = 0;
+    for (int v : a) s += (long long)v;
     return s;
 }
 
-int main()
-{
-    const int N = 100000; 
-    std::vector<float> h_arr(N);
+int main() {
+    const int N = 100000;          // размер массива по заданию
+    const int BLOCK = 256;         // типичный размер блока
+    const int GRID = (N + BLOCK - 1) / BLOCK; // сколько блоков нужно
 
-    // Заполним случайными числами, чтобы тест был "живой"
-    std::mt19937 rng(123);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    for (int i = 0; i < N; ++i) h_arr[i] = dist(rng);
+    std::cout << "N=" << N << ", BLOCK=" << BLOCK << ", GRID=" << GRID << "\n";
 
-    // CPU: сумма + замер времени
+    // Генерируем входные данные на CPU
+    std::vector<int> h_in(N);
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist(0, 100);
+
+    for (int i = 0; i < N; i++) h_in[i] = dist(rng);
+
+    // CPU: считаем сумму и время 
     auto cpu_t0 = std::chrono::high_resolution_clock::now();
-    double cpu_result = cpuSum(h_arr);
+    long long cpu_res = cpu_sum(h_in);
     auto cpu_t1 = std::chrono::high_resolution_clock::now();
     double cpu_ms = std::chrono::duration<double, std::milli>(cpu_t1 - cpu_t0).count();
 
-    // GPU: память + сумма + замер времени
-    float* d_arr = nullptr;
-    float* d_sum = nullptr;
+    // GPU: выделяем память 
+    int* d_in = nullptr;
+    long long* d_blockSums = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_arr, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d_in, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_blockSums, GRID * sizeof(long long)));
 
-    CUDA_CHECK(cudaMemcpy(d_arr, h_arr.data(), N * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_sum, 0, sizeof(float)));
+    // Копируем вход на GPU
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), N * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Настройки запуска
-    // Для N=100000 обычно хватает нескольких сотен блоков.
-    // Берём 256 потоков в блоке — стандартный вариант.
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
-
-    // Чтобы не запускать слишком много блоков (иногда только мешает), ограничим до разумного числа (например 1024).
-    if (blocks > 1024) blocks = 1024;
-
-    // CUDA Events — нормальный способ мерить время ядра на GPU
+    // GPU: замер времени kernel через cudaEvent 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
     CUDA_CHECK(cudaEventRecord(start));
-    sumGlobalAtomic<<<blocks, threads>>>(d_arr, N, d_sum);
-    CUDA_CHECK(cudaEventRecord(stop));
 
-    // Проверяем, что ядро реально отработало без ошибок
-    CUDA_CHECK(cudaGetLastError());
+    // shared memory на блок: BLOCK * sizeof(long long)
+    sum_global_kernel<<<GRID, BLOCK, BLOCK * sizeof(long long)>>>(d_in, d_blockSums, N);
+
+    CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
-    float gpu_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, start, stop));
+    // Проверяем ошибки запуска kernel
+    CUDA_CHECK(cudaGetLastError());
 
-    float gpu_result = 0.0f;
-    CUDA_CHECK(cudaMemcpy(&gpu_result, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+    float gpu_kernel_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&gpu_kernel_ms, start, stop));
 
-    // Сравнение результатов 
-    // CPU у нас double, GPU float. Поэтому небольшая разница по округлению возможна.
-    double diff = std::abs(cpu_result - static_cast<double>(gpu_result));
+    // Считываем суммы блоков назад и суммируем на CPU (финальный reduction) 
+    std::vector<long long> h_blockSums(GRID);
+    CUDA_CHECK(cudaMemcpy(h_blockSums.data(), d_blockSums, GRID * sizeof(long long), cudaMemcpyDeviceToHost));
 
-    std::cout << std::fixed << std::setprecision(6);
-    std::cout << "N = " << N << "\n\n";
-    std::cout << "CPU sum  = " << cpu_result << "\n";
-    std::cout << "GPU sum  = " << gpu_result << "\n";
-    std::cout << "Abs diff = " << diff << "\n\n";
+    long long gpu_res = 0;
+    for (int i = 0; i < GRID; i++) gpu_res += h_blockSums[i];
 
-    std::cout << "CPU time (ms): " << cpu_ms << "\n";
-    std::cout << "GPU kernel time (ms): " << gpu_ms << "\n";
-    std::cout << "Grid: blocks=" << blocks << ", threads=" << threads << "\n";
+    // Вывод результатов 
+    std::cout << "CPU sum: " << cpu_res << "\n";
+    std::cout << "GPU sum: " << gpu_res << "\n";
+    std::cout << "Match:   " << (cpu_res == gpu_res ? "YES" : "NO") << "\n\n";
 
-    // Очистка
+    std::cout << "CPU time (ms):      " << cpu_ms << "\n";
+    std::cout << "GPU kernel time(ms): " << gpu_kernel_ms << "\n";
+
+    // Освобождаем ресурсы
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-
-    CUDA_CHECK(cudaFree(d_arr));
-    CUDA_CHECK(cudaFree(d_sum));
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_blockSums));
 
     return 0;
 }
