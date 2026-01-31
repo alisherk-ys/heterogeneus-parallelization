@@ -53,8 +53,8 @@ int main(int argc, char** argv) {
     // argv[1] = N (размер графа)
     // argv[2] = probEdge (вероятность ребра)
     // argv[3] = maxWeight (максимальный вес ребра)
-    int N = 8;                 // маленький по умолчанию (для отладки/печати)
-    double probEdge = 0.30;    // плотность ребер
+    int N = 256;                
+    double probEdge = 0.08;    // плотность ребер
     int maxWeight = 20;        // максимум веса
 
     if (argc >= 2) N = std::max(2, std::atoi(argv[1]));
