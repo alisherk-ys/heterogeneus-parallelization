@@ -99,7 +99,6 @@ int main(int argc, char** argv) {
         ? std::max(1, std::stoi(argv[2]))
         : std::min(16, omp_get_max_threads());
 
-    std::cout << "Practical Work #10 (OpenMP): sum/mean/variance\n";
     std::cout << "N = " << N << ", max_threads = " << max_threads << "\n\n";
 
 
